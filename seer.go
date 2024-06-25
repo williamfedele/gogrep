@@ -1,25 +1,37 @@
 package main
 
+/*
+ * seer.go
+ * A simple grep-like tool written in Go.
+ * Usage: seer [OPTIONS] PATTERN FILE...
+ * Options:
+ * -c: Only a count of selected lines is written to standard output.
+ * -e: An input line is selected if it matches the pattern evaluated as a regular expression.
+ * -i: Perform case insensitive matching.
+ * -l: Only print file names with matches.
+ * -m: Stop reading a file after m matching lines.
+ * -g: Sets the maximum amount of goroutines to search the files. Default=amount of files.
+ */
+
 import (
 	"bufio"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
-
-	"github.com/charmbracelet/log"
 )
 
 type Options struct {
 	onlyCount            bool
 	filesWithMatches     bool
-	filesWithoutMatches  bool
 	maxMatches           int
 	suppressNormalOutput bool
 	numFiles             int
 	regexp               bool
+	regexpPattern        regexp.Regexp
 	caseInsensitive      bool
 	invertMatch          bool
 }
@@ -38,12 +50,6 @@ func FilesWithMatches() Option {
 	}
 }
 
-func FilesWithoutMatches() Option {
-	return func(o *Options) {
-		o.filesWithoutMatches = true
-	}
-}
-
 func MaxMatches(max int) Option {
 	return func(o *Options) {
 		o.maxMatches = max
@@ -56,9 +62,10 @@ func NumFiles(fileCount int) Option {
 	}
 }
 
-func Regexp() Option {
+func Regexp(pattern regexp.Regexp) Option {
 	return func(o *Options) {
 		o.regexp = true
+		o.regexpPattern = pattern
 	}
 }
 
@@ -84,11 +91,7 @@ func (m Matcher) Match(pattern string, input string) bool {
 		input = strings.ToLower(input)
 	}
 	if m.options.regexp {
-		matched, err := regexp.MatchString(pattern, input)
-		if err != nil {
-			return false
-		}
-		return matched
+		return m.options.regexpPattern.MatchString(input)
 	} else {
 		return strings.Contains(input, pattern)
 	}
@@ -98,7 +101,6 @@ func NewMatcher(opts ...Option) Matcher {
 	options := Options{
 		onlyCount:            false,
 		filesWithMatches:     false,
-		filesWithoutMatches:  false,
 		maxMatches:           -1,
 		suppressNormalOutput: false,
 		numFiles:             1,
@@ -109,8 +111,8 @@ func NewMatcher(opts ...Option) Matcher {
 		opt(&options)
 	}
 
-	// Calculate if normal output is suppressed
-	options.suppressNormalOutput = options.onlyCount || options.filesWithMatches || options.filesWithoutMatches
+	// With certain flags, we don't want to print each matching line
+	options.suppressNormalOutput = options.onlyCount || options.filesWithMatches
 
 	return Matcher{
 		options: options,
@@ -121,10 +123,8 @@ func searchFile(
 	filePath string,
 	matcher Matcher,
 	pattern string,
-	wg *sync.WaitGroup,
 	results chan<- string,
 ) {
-	defer wg.Done()
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -151,6 +151,12 @@ func searchFile(
 			}
 
 			if !matcher.options.suppressNormalOutput {
+				if matcher.options.regexp {
+					line = matcher.options.regexpPattern.ReplaceAllString(line, fmt.Sprintf("\x1b[%dm%s\x1b[0m", 32, "$0"))
+				} else {
+					line = strings.Replace(line, pattern, fmt.Sprintf("\x1b[%dm%s\x1b[0m", 32, pattern), -1)
+				}
+
 				if matcher.options.numFiles > 1 {
 					results <- fmt.Sprintf("%s:%s\n", filePath, line)
 				} else {
@@ -167,46 +173,43 @@ func searchFile(
 		log.Fatal(err)
 	}
 
-	if matcher.options.onlyCount || matcher.options.maxMatches != -1 {
+	if matcher.options.onlyCount {
 		results <- fmt.Sprintf("%s:%d\n", filePath, lineCount)
 	}
 	if matcher.options.filesWithMatches && hasMatch {
 		results <- fmt.Sprintln(filePath)
 	}
-	if matcher.options.filesWithoutMatches && !hasMatch {
-		results <- fmt.Sprintln(filePath)
+}
+
+func worker(jobs <-chan string, results chan<- string, wg *sync.WaitGroup, matcher Matcher, pattern string) {
+	defer wg.Done()
+	for job := range jobs {
+		searchFile(job, matcher, pattern, results)
 	}
 }
 
 func main() {
-	//log.SetLevel(log.DebugLevel)
-
+	// Parse flags
 	var options []Option
 
 	// Optional flags
 	onlyCount := flag.Bool("c", false, "Only a count of selected lines is written to standard output.")
-	regexp := flag.Bool("e", false, "An input line is selected if it matches any of the specified patterns.")
+	useRegexp := flag.Bool("e", false, "An input line is selected if it matches the pattern evaluated as a regular expression.")
 	caseInsensitive := flag.Bool("i", false, "Perform case insensitive matching.")
-	filesWithMatches := flag.Bool("l", false, "Only print files with matches.")
-	filesWithoutMatches := flag.Bool("L", false, "Only print files without matches.")
+	filesWithMatches := flag.Bool("l", false, "Only print file names with matches.")
 	maxCount := flag.Int("m", -1, "Stop reading a file after m matching lines.")
+	maxGoroutines := flag.Int("g", -1, "Sets the maximum amount of goroutines to search the files. Default=amount of files.")
 
 	flag.Parse()
 
 	if *onlyCount {
 		options = append(options, OnlyCount())
 	}
-	if *regexp {
-		options = append(options, Regexp())
-	}
 	if *caseInsensitive {
 		options = append(options, CaseInsensitive())
 	}
 	if *filesWithMatches {
 		options = append(options, FilesWithMatches())
-	}
-	if *filesWithoutMatches {
-		options = append(options, FilesWithoutMatches())
 	}
 	options = append(options, MaxMatches(*maxCount))
 
@@ -220,6 +223,20 @@ func main() {
 	pattern := tail[0]
 	files := tail[1:]
 
+	// If -e flag is set, compile the pattern as a regular expression
+	if *useRegexp {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			log.Fatal("Error compiling regular expression:", err)
+		}
+		options = append(options, Regexp(*re))
+	}
+	// Set the worker pool size. Default is the amount of files
+	poolSize := *maxGoroutines
+	if poolSize == -1 {
+		poolSize = len(files)
+	}
+
 	options = append(options, NumFiles(len(files)))
 
 	matcher := NewMatcher(options...)
@@ -227,6 +244,7 @@ func main() {
 	var wg sync.WaitGroup
 	var printWg sync.WaitGroup
 	results := make(chan string)
+	jobs := make(chan string, poolSize)
 
 	// Print results from the channel as they arrive
 	printWg.Add(1)
@@ -237,17 +255,21 @@ func main() {
 		}
 	}()
 
-	// Launch a goroutine for each file
-	for _, f := range files {
+	// Start workers
+	for i := 0; i < poolSize; i++ {
 		wg.Add(1)
-		go searchFile(f, matcher, pattern, &wg, results)
+		go worker(jobs, results, &wg, matcher, pattern)
 	}
 
-	// Wait for all goroutines
+	// Launch a goroutine for each file
+	for _, f := range files {
+		jobs <- f
+	}
+	// Done sending jobs
+	close(jobs)
+	// Wait for all workers to finish
 	wg.Wait()
-	// Close channel
 	close(results)
-	// Wait for printing to finish before exit
+	// Wait for the print goroutine to finish
 	printWg.Wait()
-
 }
