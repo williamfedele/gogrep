@@ -1,16 +1,16 @@
 package main
 
 /*
- * seer.go
+ * gogrep.go
  * A simple grep-like tool written in Go.
- * Usage: seer [OPTIONS] PATTERN FILE...
+ * Usage: gogrep [OPTIONS] PATTERN FILE...
  * Options:
  * -c: Only a count of selected lines is written to standard output.
- * -e: An input line is selected if it matches the pattern evaluated as a regular expression.
+ * -e: The pattern is evaluated as a regular expression.
  * -i: Perform case insensitive matching.
- * -l: Only print file names with matches.
- * -m: Stop reading a file after m matching lines.
- * -g: Sets the maximum amount of goroutines to search the files. Default=amount of files.
+ * -l: Only print file names with matches to standard output.
+ * -m NUM: Stop reading a file after NUM matching lines.
+ * -g: Sets the maximum amount of goroutines to search the files. Default=number of logical CPUs.
  */
 
 import (
@@ -19,7 +19,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -33,7 +35,6 @@ type Options struct {
 	regexp               bool
 	regexpPattern        regexp.Regexp
 	caseInsensitive      bool
-	invertMatch          bool
 }
 
 type Option func(*Options)
@@ -72,12 +73,6 @@ func Regexp(pattern regexp.Regexp) Option {
 func CaseInsensitive() Option {
 	return func(o *Options) {
 		o.caseInsensitive = true
-	}
-}
-
-func InvertMatch() Option {
-	return func(o *Options) {
-		o.invertMatch = true
 	}
 }
 
@@ -145,19 +140,21 @@ func searchFile(
 			hasMatch = true
 			lineCount++
 
-			// file search stops once a match is found
+			// File search stops once a match is found
 			if matcher.options.filesWithMatches {
 				break
 			}
 
 			if !matcher.options.suppressNormalOutput {
+				// The matched pattern is highlighted
+
 				if matcher.options.regexp {
 					line = matcher.options.regexpPattern.ReplaceAllString(line, fmt.Sprintf("\x1b[%dm%s\x1b[0m", 32, "$0"))
 				} else {
 					line = strings.Replace(line, pattern, fmt.Sprintf("\x1b[%dm%s\x1b[0m", 32, pattern), -1)
 				}
 
-				if matcher.options.numFiles > 1 {
+				if matcher.options.numFiles != 1 {
 					results <- fmt.Sprintf("%s:%s\n", filePath, line)
 				} else {
 					results <- fmt.Sprintln(line)
@@ -231,13 +228,39 @@ func main() {
 		}
 		options = append(options, Regexp(*re))
 	}
-	// Set the worker pool size. Default is the amount of files
+
+	// Determine the number of files to search
+	var filePaths []string
+	for _, f := range files {
+		fileInfo, err := os.Stat(f)
+		if err != nil {
+			log.Fatal(err)
+		}
+		// Find all files in a directory and its subdirectories
+		if fileInfo.IsDir() {
+			err := filepath.WalkDir(f, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if !d.IsDir() {
+					filePaths = append(filePaths, path)
+				}
+				return nil
+			})
+			if err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			filePaths = append(filePaths, f)
+		}
+	}
+	options = append(options, NumFiles(len(filePaths)))
+
+	// Set the worker pool size. Default is the number of logical CPUs
 	poolSize := *maxGoroutines
 	if poolSize == -1 {
-		poolSize = len(files)
+		poolSize = runtime.NumCPU()
 	}
-
-	options = append(options, NumFiles(len(files)))
 
 	matcher := NewMatcher(options...)
 
@@ -262,8 +285,8 @@ func main() {
 	}
 
 	// Launch a goroutine for each file
-	for _, f := range files {
-		jobs <- f
+	for _, file := range filePaths {
+		jobs <- file
 	}
 	// Done sending jobs
 	close(jobs)
