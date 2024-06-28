@@ -35,6 +35,7 @@ type Options struct {
 	regexp               bool
 	regexpPattern        regexp.Regexp
 	caseInsensitive      bool
+	lineNumbers          bool
 }
 
 type Option func(*Options)
@@ -76,6 +77,12 @@ func CaseInsensitive() Option {
 	}
 }
 
+func LineNumbers() Option {
+	return func(o *Options) {
+		o.lineNumbers = true
+	}
+}
+
 type Matcher struct {
 	options Options
 }
@@ -101,6 +108,7 @@ func NewMatcher(opts ...Option) Matcher {
 		numFiles:             1,
 		regexp:               false,
 		caseInsensitive:      false,
+		lineNumbers:          false,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -128,17 +136,19 @@ func searchFile(
 	defer file.Close()
 
 	hasMatch := false
+	matchCount := 0
 	lineCount := 0
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
+		lineCount++
 		if len(line) == 0 {
 			continue
 		}
 		if matcher.Match(pattern, line) {
 			hasMatch = true
-			lineCount++
+			matchCount++
 
 			// File search stops once a match is found
 			if matcher.options.filesWithMatches {
@@ -146,12 +156,16 @@ func searchFile(
 			}
 
 			if !matcher.options.suppressNormalOutput {
-				// The matched pattern is highlighted
 
+				// The matched pattern is highlighted
 				if matcher.options.regexp {
 					line = matcher.options.regexpPattern.ReplaceAllString(line, fmt.Sprintf("\x1b[%dm%s\x1b[0m", 32, "$0"))
 				} else {
 					line = strings.Replace(line, pattern, fmt.Sprintf("\x1b[%dm%s\x1b[0m", 32, pattern), -1)
+				}
+
+				if matcher.options.lineNumbers {
+					line = fmt.Sprintf("%d:%s", lineCount, line)
 				}
 
 				if matcher.options.numFiles != 1 {
@@ -161,7 +175,7 @@ func searchFile(
 				}
 			}
 
-			if matcher.options.maxMatches != -1 && lineCount == matcher.options.maxMatches {
+			if matcher.options.maxMatches != -1 && matchCount == matcher.options.maxMatches {
 				break
 			}
 		}
@@ -171,7 +185,7 @@ func searchFile(
 	}
 
 	if matcher.options.onlyCount {
-		results <- fmt.Sprintf("%s:%d\n", filePath, lineCount)
+		results <- fmt.Sprintf("%s:%d\n", filePath, matchCount)
 	}
 	if matcher.options.filesWithMatches && hasMatch {
 		results <- fmt.Sprintln(filePath)
@@ -185,51 +199,7 @@ func worker(jobs <-chan string, results chan<- string, wg *sync.WaitGroup, match
 	}
 }
 
-func main() {
-	// Parse flags
-	var options []Option
-
-	// Optional flags
-	onlyCount := flag.Bool("c", false, "Only a count of selected lines is written to standard output.")
-	useRegexp := flag.Bool("e", false, "An input line is selected if it matches the pattern evaluated as a regular expression.")
-	caseInsensitive := flag.Bool("i", false, "Perform case insensitive matching.")
-	filesWithMatches := flag.Bool("l", false, "Only print file names with matches.")
-	maxCount := flag.Int("m", -1, "Stop reading a file after m matching lines.")
-	maxGoroutines := flag.Int("g", -1, "Sets the maximum amount of goroutines to search the files. Default=amount of files.")
-
-	flag.Parse()
-
-	if *onlyCount {
-		options = append(options, OnlyCount())
-	}
-	if *caseInsensitive {
-		options = append(options, CaseInsensitive())
-	}
-	if *filesWithMatches {
-		options = append(options, FilesWithMatches())
-	}
-	options = append(options, MaxMatches(*maxCount))
-
-	// Mandatory arguments
-	tail := flag.Args()
-	// Non-flag args should have a pattern and at least one file
-	if len(tail) < 2 {
-		log.Fatal("Missing pattern or file.")
-	}
-
-	pattern := tail[0]
-	files := tail[1:]
-
-	// If -e flag is set, compile the pattern as a regular expression
-	if *useRegexp {
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			log.Fatal("Error compiling regular expression:", err)
-		}
-		options = append(options, Regexp(*re))
-	}
-
-	// Determine the number of files to search
+func getFilesToSearch(files []string) []string {
 	var filePaths []string
 	for _, f := range files {
 		fileInfo, err := os.Stat(f)
@@ -254,6 +224,59 @@ func main() {
 			filePaths = append(filePaths, f)
 		}
 	}
+	return filePaths
+}
+
+func main() {
+	// Parse flags
+	var options []Option
+
+	// Optional flags
+	onlyCount := flag.Bool("c", false, "Only a count of selected lines is written to standard output.")
+	useRegexp := flag.Bool("e", false, "An input line is selected if it matches the pattern evaluated as a regular expression.")
+	caseInsensitive := flag.Bool("i", false, "Perform case insensitive matching.")
+	filesWithMatches := flag.Bool("l", false, "Only print file names with matches.")
+	maxCount := flag.Int("m", -1, "Stop reading a file after m matching lines.")
+	maxGoroutines := flag.Int("g", -1, "Sets the maximum amount of goroutines to search the files. Default=amount of files.")
+	lineNumbers := flag.Bool("n", false, "Each output line is preceded by its relative line number in the file, starting at line 1.")
+
+	flag.Parse()
+
+	if *onlyCount {
+		options = append(options, OnlyCount())
+	}
+	if *caseInsensitive {
+		options = append(options, CaseInsensitive())
+	}
+	if *filesWithMatches {
+		options = append(options, FilesWithMatches())
+	}
+	if *lineNumbers {
+		options = append(options, LineNumbers())
+	}
+	options = append(options, MaxMatches(*maxCount))
+
+	// Mandatory arguments
+	tail := flag.Args()
+	// Non-flag args should have a pattern and at least one file
+	if len(tail) < 2 {
+		log.Fatal("Missing pattern or file.")
+	}
+
+	pattern := tail[0]
+	files := tail[1:]
+
+	// If -e flag is set, compile the pattern as a regular expression
+	if *useRegexp {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			log.Fatal("Error compiling regular expression:", err)
+		}
+		options = append(options, Regexp(*re))
+	}
+
+	// Determine the number of files to search
+	filePaths := getFilesToSearch(files)
 	options = append(options, NumFiles(len(filePaths)))
 
 	// Set the worker pool size. Default is the number of logical CPUs
